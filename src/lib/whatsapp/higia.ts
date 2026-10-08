@@ -15,6 +15,8 @@ import { FERRAMENTAS_AGENDA, executarFerramentaAgenda } from "@/lib/agente/ferra
 import { processarComprovanteHigia, acharComprovanteNovo } from "./comprovante-higia";
 import { enviarOnboardingPacoteCredito } from "./boas-vindas";
 import { enviarResumoReservas } from "./resumo-reserva";
+import { contabilizar, type UsoApi } from "./uso-api";
+import { aplicarGuardrailPagamento } from "./guardrail-pagamento";
 
 export interface ResultadoHigia {
   enviada: boolean;
@@ -151,6 +153,9 @@ export async function gerarRespostaHigia(conversaId: string): Promise<ResultadoH
   // crédito cobriu a reserva) — nesse caso a Hígia PODE dizer "confirmada" e o guardrail
   // de pagamento (RE_CONFIRMA) não deve reescrever o texto pedindo comprovante.
   let confirmadoPorSaldo = false;
+  // CUSTO: soma o consumo de TODAS as chamadas desta mensagem (o loop de ferramentas faz
+  // várias). Sem isso não há como responder "por que o consumo subiu" — e era o caso.
+  const uso = { chamadas: 0, entrada: 0, saida: 0, cacheEscrito: 0, cacheLido: 0 };
   // Reservas recém-confirmadas por pacote/crédito (sem comprovante) NESTE turno → precisam do
   // onboarding de acesso, que normalmente só sai no fluxo de comprovante Pix. Acumulamos TODAS
   // do lote (o cliente pode agendar várias sessões numa mensagem) para enviar uma vez por sala.
@@ -180,7 +185,8 @@ export async function gerarRespostaHigia(conversaId: string): Promise<ResultadoH
         const retentavel = res.status >= 500 || res.status === 429;
         return { enviada: false, motivo: `LLM HTTP ${res.status}${retentavel ? "" : " (definitivo)"}` };
       }
-      const data = (await res.json()) as { content?: Bloco[]; stop_reason?: string };
+      const data = (await res.json()) as { content?: Bloco[]; stop_reason?: string; usage?: Record<string, number> };
+      contabilizar(uso, data.usage);
       const blocos = data.content ?? [];
       const chamadas = blocos.filter((b) => b.type === "tool_use");
 
@@ -237,7 +243,8 @@ export async function gerarRespostaHigia(conversaId: string): Promise<ResultadoH
         }),
       });
       if (res.ok) {
-        const data = (await res.json()) as { content?: Bloco[] };
+        const data = (await res.json()) as { content?: Bloco[]; usage?: Record<string, number> };
+      contabilizar(uso, data.usage);
         texto = (data.content ?? [])
           .filter((b) => b.type === "text" && b.text)
           .map((b) => b.text as string)
@@ -262,29 +269,9 @@ export async function gerarRespostaHigia(conversaId: string): Promise<ResultadoH
   // forma — promessa de handoff sem handoff deixava o cliente esperando por ninguém (S/M1).
   if (!escalar && prometeAtendimentoHumano(texto)) escalar = true;
   let violou = false;
-  // Segunda linha de defesa pós-LLM (recall priorizado: falso-positivo só escala).
-  // Cobre substantivo+verbo, verbo+substantivo, confirmações curtas e coloquiais.
-  const RE_CONFIRMA = new RegExp(
-    [
-      "(pagamento|pix|comprovante|reserva)\\s+(foi\\s+|est[áa]\\s+|já\\s+)?(confirmad|aprovad|recebid|garantid|pag[oa])",
-      "\\b(recebi|confirmei|aprovei|validei)\\b[^.!?\\n]{0,25}\\b(pix|pagamento|comprovante|reserva|valor)\\b",
-      "(^|[\\n.!?]\\s*)(confirmad[oa]|aprovad[oa])\\s*[!.]",
-      "\\b(t[áa]|est[áa])\\s+(tudo\\s+)?(pag[oa]|confirmad[oa])\\b",
-      "\\b(pix|pagamento)\\b[^.!?\\n]{0,15}\\b(caiu|entrou|compensad[oa])\\b",
-      "\\bquitad[oa]\\b",
-    ].join("|"),
-    "iu"
-  );
-  if (RE_CONFIRMA.test(texto) && !confirmadoPorSaldo) {
-    // Quem confirma pagamento é o CÓDIGO (processarComprovanteHigia), ao receber a
-    // IMAGEM do comprovante — nunca o texto do LLM. Se o LLM tentou afirmar
-    // confirmação (ex.: cliente mandou a palavra "comprovante" sem anexar o print),
-    // troca por um pedido do comprovante real. NÃO escala (sem handoff para equipe).
-    // EXCEÇÃO: reserva paga por saldo de pacote/crédito É confirmada de verdade — não reescreve.
-    violou = true;
-    texto =
-      "Pra confirmar, me envia aqui o comprovante do Pix, tá? Pode ser print, imagem ou o PDF do banco. Assim que chegar eu confirmo na hora 🙏";
-  }
+  const guard = aplicarGuardrailPagamento(texto, confirmadoPorSaldo);
+  texto = guard.texto;
+  violou = guard.violou;
 
   // A Hígia pode pedir fotos ([FOTO: id]) e o Pix ([PIX]). Separa os marcadores:
   // manda o texto LIMPO e depois envia Pix (texto) e fotos.
@@ -474,6 +461,12 @@ export async function gerarRespostaHigia(conversaId: string): Promise<ResultadoH
     conversaId,
     clienteId: conv.cliente_id,
     modelo: cfg.modelo_ia,
+    // Consumo desta mensagem (todas as chamadas somadas) — base para acompanhar o custo.
+    chamadas_api: uso.chamadas,
+    tokens_entrada: uso.entrada,
+    tokens_saida: uso.saida,
+    tokens_cache_escrito: uso.cacheEscrito,
+    tokens_cache_lido: uso.cacheLido,
     blocos: blocosTexto + blocosMidia,
     latenciaMs: Date.now() - inicio,
     resposta: texto,

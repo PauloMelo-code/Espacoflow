@@ -195,7 +195,58 @@ async function main() {
     `${r3.motivo ?? "-"} / pagamento ${pg2Depois.status}`
   );
 
-  // 7) Anti-reuso: rodar de novo NÃO pode confirmar nada novo nem repetir
+  // 7) HOLD EXPIRADO (relatório 25/09): o cliente paga DEPOIS dos 45 min (ou no dia seguinte).
+  //    A reserva já foi cancelada; se o horário continua livre, ela TEM que voltar e confirmar.
+  const ini3 = new Date(inicio.getTime() + 10 * 3_600_000);
+  const [res3] = await db
+    .insert(reservas)
+    .values({
+      cliente_id: cli.id,
+      sala_id: sala.id,
+      data: ini3.toISOString().slice(0, 10),
+      hora: "20:00:00",
+      duracao_min: 60,
+      inicio_em: ini3,
+      fim_em: new Date(ini3.getTime() + 3_600_000),
+      status_reserva: "cancelada", // hold expirou
+      status_pagamento: "pendente",
+      origem: "higia",
+      notas_internas: "Hold expirado (sem pagamento)",
+    })
+    .returning();
+  const [pg3] = await db
+    .insert(pagamentos)
+    .values({
+      cliente_id: cli.id,
+      reserva_id: res3.id,
+      valor: "40.00",
+      status: "pendente",
+      provedor: "pix_manual",
+      created_at: new Date(Date.now() - 120_000),
+    })
+    .returning();
+  const urlPdf3 = `http://127.0.0.1:0/x.pdf`; // não usada: o payload traz o arquivo
+  await db.insert(whatsappMensagens).values({
+    conversa_id: conv.id,
+    origem: "user",
+    tipo: "document",
+    conteudo: "comprovante_atrasado.pdf",
+    midia_url: urlPdf3,
+    midia_tipo: "document",
+    payload_bruto: { data: { message: { base64: pdf.toString("base64") } } },
+    created_at: new Date(),
+    enviada_em: new Date(),
+  });
+  await gerarRespostaHigia(conv.id);
+  const [res3Depois] = await db.select().from(reservas).where(eq(reservas.id, res3.id));
+  const [pg3Depois] = await db.select().from(pagamentos).where(eq(pagamentos.id, pg3.id));
+  assert(
+    "hold expirado + comprovante depois: RESERVA VOLTA e confirma",
+    res3Depois.status_reserva === "confirmada" && pg3Depois.status === "confirmado",
+    `reserva ${res3Depois.status_reserva} / pagamento ${pg3Depois.status}`
+  );
+
+  // 8) Anti-reuso: rodar de novo NÃO pode confirmar nada novo nem repetir
   const r2 = await gerarRespostaHigia(conv.id);
   assert("não reprocessa o mesmo comprovante", r2.motivo !== "pagamento confirmado (IA)", r2.motivo ?? "-");
 

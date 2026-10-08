@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNotNull, ne, notInArray } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, ne, notInArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { pagamentos } from "@/lib/db/schema/pagamentos";
 import { reservas } from "@/lib/db/schema/reservas";
@@ -17,6 +17,7 @@ import { getProvider } from "./provider";
 import { enviarHumanizado } from "./humanizar";
 import { enviarBoasVindas } from "./boas-vindas";
 import { resumoReservaTexto } from "./resumo-reserva";
+import { reativarHoldsExpirados } from "./reativar-hold";
 import { midiaEhComprovante, comprovanteJaUsado, extrairBase64DoPayload } from "./comprovante-midia";
 
 export interface ResultadoComprovante {
@@ -323,7 +324,13 @@ export async function processarComprovanteHigia(params: {
           )
         )
     : [];
-  const reservaIdsOk = vivas.map((v) => v.id);
+  let reservaIdsOk = vivas.map((v) => v.id);
+
+  // Hold expirado + comprovante depois: devolve a reserva se o horário ainda estiver livre.
+  if (reservaIdsOk.length === 0 && reservaIds.length > 0) {
+    reservaIdsOk = await reativarHoldsExpirados(reservaIds);
+  }
+
   const idsOk = pendentes.filter((p) => p.reserva_id && reservaIdsOk.includes(p.reserva_id)).map((p) => p.id);
   // Pagamentos do MESMO comprovante cuja reserva não está mais ativa (lote misto):
   // não somem em silêncio — vão para em_análise + auditoria (a equipe verifica).
